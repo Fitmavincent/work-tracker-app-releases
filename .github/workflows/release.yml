@@ -1,0 +1,328 @@
+name: Publish Worklog desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Private source tag to build, for example v0.2.0
+        required: true
+        default: v0.2.0
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-desktop-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: Fitmavincent/work-tracker
+
+jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      version: ${{ steps.release.outputs.version }}
+      should_release: ${{ steps.release.outputs.should_release }}
+    steps:
+      - name: Check out private source with the read-only deploy key
+        uses: actions/checkout@v7
+        with:
+          repository: Fitmavincent/work-tracker
+          ssh-key: ${{ secrets.SOURCE_REPOSITORY_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate the source release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            release_tag="$DISPATCH_TAG"
+          else
+            release_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
+          fi
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use the vMAJOR.MINOR.PATCH format." >&2
+            exit 1
+          fi
+          if ! git rev-parse --verify "$release_tag^{commit}" >/dev/null 2>&1; then
+            echo "Source tag $release_tag was not found." >&2
+            exit 1
+          fi
+
+          git checkout --detach "$release_tag"
+          package_version="$(node -p "require('./package.json').version")"
+          tauri_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+
+          if [[ "$release_tag" != "v$package_version" ]]; then
+            echo "Tag $release_tag does not match package.json version $package_version." >&2
+            exit 1
+          fi
+          if [[ "$tauri_version" != "$package_version" || "$cargo_version" != "$package_version" ]]; then
+            echo "package.json, tauri.conf.json, and Cargo.toml versions must match." >&2
+            exit 1
+          fi
+
+          should_release=true
+          if [[ "${{ github.event_name }}" == "schedule" ]] && gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_release=false
+          fi
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
+  windows-installer:
+    needs: validate-release
+    if: needs.validate-release.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged private source
+        uses: actions/checkout@v7
+        with:
+          repository: Fitmavincent/work-tracker
+          ref: ${{ needs.validate-release.outputs.release_tag }}
+          ssh-key: ${{ secrets.SOURCE_REPOSITORY_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npx tsc --noEmit
+      - run: npm run lint
+      - run: npm run desktop:build:windows
+
+      - name: Prepare installer and checksum
+        id: artifact
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "The NSIS installer was not created." }
+
+          $artifactDirectory = Join-Path $env:RUNNER_TEMP "windows-installer"
+          New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+          $artifactName = "Worklog_$($env:APP_VERSION)_x64-setup.exe"
+          $artifactPath = Join-Path $artifactDirectory $artifactName
+          Copy-Item $installer.FullName $artifactPath
+
+          $checksum = Get-FileHash $artifactPath -Algorithm SHA256
+          $checksumPath = "$artifactPath.sha256.txt"
+          $checksumLine = "$($checksum.Hash.ToLower())  $artifactName`n"
+          [System.IO.File]::WriteAllText(
+            $checksumPath,
+            $checksumLine,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          "installer=$artifactPath" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke-test Windows installation
+        shell: pwsh
+        run: |
+          $installer = "${{ steps.artifact.outputs.installer }}"
+          $installProcess = Start-Process -FilePath $installer -ArgumentList "/S" -PassThru -Wait
+          if ($installProcess.ExitCode -ne 0) {
+            throw "The installer exited with code $($installProcess.ExitCode)."
+          }
+
+          $application = Get-ChildItem -Path $env:LOCALAPPDATA -Filter "worklog.exe" -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $application) {
+            throw "The installed Worklog executable was not found beneath LOCALAPPDATA."
+          }
+
+          $appProcess = Start-Process -FilePath $application.FullName -PassThru
+          Start-Sleep -Seconds 8
+          if ($appProcess.HasExited) {
+            throw "Worklog exited during the launch smoke test with code $($appProcess.ExitCode)."
+          }
+          Stop-Process -Id $appProcess.Id -Force
+
+      - name: Upload validated Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: ${{ runner.temp }}/windows-installer/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-dmg:
+    needs: validate-release
+    if: needs.validate-release.outputs.should_release == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Check out tagged private source
+        uses: actions/checkout@v7
+        with:
+          repository: Fitmavincent/work-tracker
+          ref: ${{ needs.validate-release.outputs.release_tag }}
+          ssh-key: ${{ secrets.SOURCE_REPOSITORY_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npx tsc --noEmit
+      - run: npm run lint
+      - run: npm run desktop:build:macos
+
+      - name: Prepare DMG and checksum
+        id: artifact
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          dmg="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -type f -print -quit)"
+          if [[ -z "$dmg" ]]; then
+            echo "The universal macOS DMG was not created." >&2
+            exit 1
+          fi
+
+          artifact_directory="$RUNNER_TEMP/macos-dmg"
+          mkdir -p "$artifact_directory"
+          artifact_name="Worklog_${APP_VERSION}_universal.dmg"
+          artifact_path="$artifact_directory/$artifact_name"
+          cp "$dmg" "$artifact_path"
+          checksum_path="$artifact_path.sha256.txt"
+          checksum="$(shasum -a 256 "$artifact_path" | awk '{print $1}')"
+          printf '%s  %s\n' "$checksum" "$artifact_name" > "$checksum_path"
+          echo "dmg=$artifact_path" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test macOS application launch
+        shell: bash
+        run: |
+          dmg="${{ steps.artifact.outputs.dmg }}"
+          mount_point="$RUNNER_TEMP/worklog-dmg"
+          mkdir -p "$mount_point"
+          hdiutil verify "$dmg"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_point"
+          cleanup() {
+            hdiutil detach "$mount_point" -force >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          app="$mount_point/Worklog.app"
+          if [[ ! -d "$app" ]]; then
+            echo "Worklog.app was not found in the mounted DMG." >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict "$app"
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          executable="$app/Contents/MacOS/$executable_name"
+          architectures="$(lipo -archs "$executable")"
+          if [[ "$architectures" != *arm64* || "$architectures" != *x86_64* ]]; then
+            echo "The DMG application is not universal: $architectures" >&2
+            exit 1
+          fi
+
+          "$executable" &
+          app_pid=$!
+          sleep 8
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            wait "$app_pid"
+            echo "Worklog exited during the macOS launch smoke test." >&2
+            exit 1
+          fi
+          kill "$app_pid"
+          wait "$app_pid" 2>/dev/null || true
+
+      - name: Upload validated macOS DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-dmg
+          path: ${{ runner.temp }}/macos-dmg/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    needs:
+      - validate-release
+      - windows-installer
+      - macos-dmg
+    if: needs.validate-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download validated Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-installer
+          path: release-assets
+
+      - name: Download validated macOS DMG
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-dmg
+          path: release-assets
+
+      - name: Verify complete release payload
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          expected=(
+            "Worklog_${APP_VERSION}_x64-setup.exe"
+            "Worklog_${APP_VERSION}_x64-setup.exe.sha256.txt"
+            "Worklog_${APP_VERSION}_universal.dmg"
+            "Worklog_${APP_VERSION}_universal.dmg.sha256.txt"
+          )
+          for asset in "${expected[@]}"; do
+            if [[ ! -s "release-assets/$asset" ]]; then
+              echo "Missing or empty release asset: $asset" >&2
+              exit 1
+            fi
+          done
+          if [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]]; then
+            echo "The release must contain exactly four files." >&2
+            find release-assets -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          cd release-assets
+          sha256sum --check "Worklog_${APP_VERSION}_x64-setup.exe.sha256.txt"
+          sha256sum --check "Worklog_${APP_VERSION}_universal.dmg.sha256.txt"
+
+      - name: Publish complete public release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
+        run: |
+          notes='Download the Windows setup executable or universal macOS DMG for Worklog. Verify the matching SHA-256 checksum if required. These preview packages are not yet publicly trusted: Windows may show SmartScreen and macOS may require approval in Privacy & Security.'
+          assets=(release-assets/*)
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "Worklog $RELEASE_TAG" --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --title "Worklog $RELEASE_TAG" \
+              --notes "$notes"
+          fi

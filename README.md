@@ -36,6 +36,6 @@ shasum -a 256 -c Worklog_<version>_universal.dmg.sha256.txt
 
 ## Release process
 
-GitHub Actions validates matching npm, Cargo, and Tauri versions; builds Windows and macOS packages; installs or mounts and launches each package in a smoke test; verifies both checksums; and publishes the complete asset set here only after both platform jobs pass.
+GitHub Actions checks out tagged source through a read-only deploy key, validates matching npm, Cargo, and Tauri versions, builds Windows and macOS packages, installs or mounts and launches each package in a smoke test, verifies both checksums, and publishes the complete asset set here only after both platform jobs pass. The workflow runs hourly for new source tags and can also be dispatched manually.
 
 Worklog stores records on the local device. Export JSON backups regularly because application-local data is not a backup.
