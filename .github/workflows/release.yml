@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Private source tag to build, for example v0.2.0
+        description: Private source tag to build, for example v0.3.0
         required: true
-        default: v0.2.0
+        default: v0.3.0
   schedule:
     - cron: '17 * * * *'
 
@@ -42,7 +42,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DISPATCH_TAG: ${{ inputs.release_tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
+            echo "The updater signing key secrets are not configured." >&2
+            exit 1
+          fi
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             release_tag="$DISPATCH_TAG"
           else
@@ -107,21 +114,27 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm run lint
       - run: npm run desktop:build:windows
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: Prepare installer and checksum
+      - name: Prepare installer, updater signature, and checksum
         id: artifact
         shell: pwsh
         env:
           APP_VERSION: ${{ needs.validate-release.outputs.version }}
         run: |
-          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_$($env:APP_VERSION)_x64-setup.exe" | Select-Object -First 1
           if (-not $installer) { throw "The NSIS installer was not created." }
+          $installerSignature = "$($installer.FullName).sig"
+          if (-not (Test-Path $installerSignature)) { throw "The signed Windows updater artifact was not created." }
 
           $artifactDirectory = Join-Path $env:RUNNER_TEMP "windows-installer"
           New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
           $artifactName = "Worklog_$($env:APP_VERSION)_x64-setup.exe"
           $artifactPath = Join-Path $artifactDirectory $artifactName
           Copy-Item $installer.FullName $artifactPath
+          Copy-Item $installerSignature "$artifactPath.sig"
 
           $checksum = Get-FileHash $artifactPath -Algorithm SHA256
           $checksumPath = "$artifactPath.sha256.txt"
@@ -191,16 +204,24 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm run lint
       - run: npm run desktop:build:macos
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: Prepare DMG and checksum
+      - name: Prepare DMG, updater archive, signature, and checksum
         id: artifact
         shell: bash
         env:
           APP_VERSION: ${{ needs.validate-release.outputs.version }}
         run: |
-          dmg="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -type f -print -quit)"
+          dmg="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name "*_${APP_VERSION}_universal.dmg" -type f -print -quit)"
           if [[ -z "$dmg" ]]; then
             echo "The universal macOS DMG was not created." >&2
+            exit 1
+          fi
+          updater_archive="$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -name '*.app.tar.gz' -type f -print -quit)"
+          if [[ -z "$updater_archive" || ! -s "$updater_archive.sig" ]]; then
+            echo "The signed universal macOS updater archive was not created." >&2
             exit 1
           fi
 
@@ -212,6 +233,9 @@ jobs:
           checksum_path="$artifact_path.sha256.txt"
           checksum="$(shasum -a 256 "$artifact_path" | awk '{print $1}')"
           printf '%s  %s\n' "$checksum" "$artifact_name" > "$checksum_path"
+          updater_name="Worklog_${APP_VERSION}_universal.app.tar.gz"
+          cp "$updater_archive" "$artifact_directory/$updater_name"
+          cp "$updater_archive.sig" "$artifact_directory/$updater_name.sig"
           echo "dmg=$artifact_path" >> "$GITHUB_OUTPUT"
 
       - name: Smoke-test macOS application launch
@@ -280,6 +304,32 @@ jobs:
           name: macos-dmg
           path: release-assets
 
+      - name: Create signed updater manifest
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.validate-release.outputs.version }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
+        run: |
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          jq -n \
+            --arg version "$APP_VERSION" \
+            --arg notes "Worklog ${APP_VERSION} is available with the latest fixes and improvements." \
+            --arg pub_date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg windows_url "$base_url/Worklog_${APP_VERSION}_x64-setup.exe" \
+            --rawfile windows_signature "release-assets/Worklog_${APP_VERSION}_x64-setup.exe.sig" \
+            --arg macos_url "$base_url/Worklog_${APP_VERSION}_universal.app.tar.gz" \
+            --rawfile macos_signature "release-assets/Worklog_${APP_VERSION}_universal.app.tar.gz.sig" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "windows-x86_64": { signature: $windows_signature, url: $windows_url },
+                "darwin-x86_64": { signature: $macos_signature, url: $macos_url },
+                "darwin-aarch64": { signature: $macos_signature, url: $macos_url }
+              }
+            }' > release-assets/latest.json
+
       - name: Verify complete release payload
         shell: bash
         env:
@@ -287,9 +337,13 @@ jobs:
         run: |
           expected=(
             "Worklog_${APP_VERSION}_x64-setup.exe"
+            "Worklog_${APP_VERSION}_x64-setup.exe.sig"
             "Worklog_${APP_VERSION}_x64-setup.exe.sha256.txt"
             "Worklog_${APP_VERSION}_universal.dmg"
             "Worklog_${APP_VERSION}_universal.dmg.sha256.txt"
+            "Worklog_${APP_VERSION}_universal.app.tar.gz"
+            "Worklog_${APP_VERSION}_universal.app.tar.gz.sig"
+            "latest.json"
           )
           for asset in "${expected[@]}"; do
             if [[ ! -s "release-assets/$asset" ]]; then
@@ -297,8 +351,8 @@ jobs:
               exit 1
             fi
           done
-          if [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]]; then
-            echo "The release must contain exactly four files." >&2
+          if [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" != "8" ]]; then
+            echo "The release must contain exactly eight files." >&2
             find release-assets -maxdepth 1 -type f -print
             exit 1
           fi
@@ -306,6 +360,18 @@ jobs:
           cd release-assets
           sha256sum --check "Worklog_${APP_VERSION}_x64-setup.exe.sha256.txt"
           sha256sum --check "Worklog_${APP_VERSION}_universal.dmg.sha256.txt"
+          jq -e \
+            --arg version "$APP_VERSION" \
+            --rawfile windows_signature "Worklog_${APP_VERSION}_x64-setup.exe.sig" \
+            --rawfile macos_signature "Worklog_${APP_VERSION}_universal.app.tar.gz.sig" '
+            .version == $version and
+            .platforms["windows-x86_64"].signature == $windows_signature and
+            .platforms["darwin-x86_64"].signature == $macos_signature and
+            .platforms["darwin-aarch64"].signature == $macos_signature and
+            (.platforms["windows-x86_64"].url | endswith("Worklog_" + $version + "_x64-setup.exe")) and
+            (.platforms["darwin-x86_64"].url | endswith("Worklog_" + $version + "_universal.app.tar.gz")) and
+            (.platforms["darwin-aarch64"] == .platforms["darwin-x86_64"])
+          ' latest.json >/dev/null
 
       - name: Publish complete public release
         shell: bash
@@ -313,7 +379,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
         run: |
-          notes='Download the Windows setup executable or universal macOS DMG for Worklog. Verify the matching SHA-256 checksum if required. These preview packages are not yet publicly trusted: Windows may show SmartScreen and macOS may require approval in Privacy & Security.'
+          notes='Download the Windows setup executable or universal macOS DMG for Worklog. This release also publishes cryptographically signed updater packages and a latest.json feed so updater-enabled installations can update from Settings. Verify the matching SHA-256 checksum if required. These preview packages are not yet publicly trusted: Windows may show SmartScreen and macOS may require approval in Privacy & Security.'
           assets=(release-assets/*)
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

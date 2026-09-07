@@ -10,6 +10,16 @@ Download the newest packages from the [latest Worklog release](https://github.co
 - `Worklog_<version>_universal.dmg` — universal application for Apple Silicon and Intel Macs.
 - Each installer has a matching `.sha256.txt` checksum file.
 
+Worklog 0.3.0 is the one-time bootstrap for signed in-app updates. Users on 0.2.0 or earlier must install 0.3.0 manually. From 0.3.0 onward, Worklog checks this repository's latest release and offers **Install and restart** under Settings when a newer version exists.
+
+The remaining release assets support that in-app path:
+
+- the Windows installer `.sig` file;
+- a universal macOS `.app.tar.gz` and its `.sig` file; and
+- `latest.json`, which maps each supported platform to its signed update package.
+
+The app verifies those signatures before installation. They protect update integrity but are separate from Windows Authenticode and Apple Developer ID publisher trust.
+
 ## Preview trust notices
 
 These packages are public preview builds, but they are not yet signed by publicly trusted publisher identities:
@@ -36,6 +46,6 @@ shasum -a 256 -c Worklog_<version>_universal.dmg.sha256.txt
 
 ## Release process
 
-GitHub Actions checks out tagged source through a read-only deploy key, validates matching npm, Cargo, and Tauri versions, builds Windows and macOS packages, installs or mounts and launches each package in a smoke test, verifies both checksums, and publishes the complete asset set here only after both platform jobs pass. The workflow runs hourly for new source tags and can also be dispatched manually.
+GitHub Actions checks out tagged source through a read-only deploy key, validates matching npm, Cargo, and Tauri versions, builds Windows and macOS packages, signs their updater artifacts with protected repository secrets, installs or mounts and launches each package in a smoke test, verifies both checksums, creates `latest.json`, and publishes the complete eight-file asset set only after both platform jobs pass. The workflow runs hourly for new source tags and can also be dispatched manually.
 
 Worklog stores records on the local device. Export JSON backups regularly because application-local data is not a backup.
