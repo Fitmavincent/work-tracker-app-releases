@@ -264,16 +264,28 @@ jobs:
             exit 1
           fi
 
-          "$executable" &
-          app_pid=$!
+          # Launch through LaunchServices. Running the Mach-O executable directly
+          # leaves UserNotifications without a registered application bundle and
+          # can abort before the frontend finishes painting.
+          open -n "$app"
+          app_pid=""
+          for _ in {1..20}; do
+            app_pid="$(pgrep -f "$executable" | head -n 1 || true)"
+            if [[ -n "$app_pid" ]]; then
+              break
+            fi
+            sleep 0.5
+          done
+          if [[ -z "$app_pid" ]]; then
+            echo "Worklog did not start through macOS LaunchServices." >&2
+            exit 1
+          fi
           sleep 8
           if ! kill -0 "$app_pid" 2>/dev/null; then
-            wait "$app_pid"
             echo "Worklog exited during the macOS launch smoke test." >&2
             exit 1
           fi
           kill "$app_pid"
-          wait "$app_pid" 2>/dev/null || true
 
       - name: Upload validated macOS DMG
         uses: actions/upload-artifact@v7
