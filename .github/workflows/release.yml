@@ -7,8 +7,11 @@ on:
         description: Private source tag to build, for example v0.3.0
         required: true
         default: v0.3.0
-  schedule:
-    - cron: '17 * * * *'
+      confirm_release:
+        description: Confirm this manually authorized release should be built and published
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -26,7 +29,6 @@ jobs:
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       version: ${{ steps.release.outputs.version }}
-      should_release: ${{ steps.release.outputs.should_release }}
     steps:
       - name: Check out private source with the read-only deploy key
         uses: actions/checkout@v7
@@ -42,19 +44,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DISPATCH_TAG: ${{ inputs.release_tag }}
+          CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          if [[ "$CONFIRM_RELEASE" != "true" ]]; then
+            echo "The confirm_release input must be selected before publishing a desktop release." >&2
+            exit 1
+          fi
           if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
             echo "The updater signing key secrets are not configured." >&2
             exit 1
           fi
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            release_tag="$DISPATCH_TAG"
-          else
-            release_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
-          fi
+          release_tag="$DISPATCH_TAG"
 
           if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Release tag must use the vMAJOR.MINOR.PATCH format." >&2
@@ -62,6 +65,11 @@ jobs:
           fi
           if ! git rev-parse --verify "$release_tag^{commit}" >/dev/null 2>&1; then
             echo "Source tag $release_tag was not found." >&2
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$release_tag^{commit}" origin/main; then
+            echo "Source tag $release_tag must point to a commit merged into the private main branch." >&2
             exit 1
           fi
 
@@ -79,18 +87,11 @@ jobs:
             exit 1
           fi
 
-          should_release=true
-          if [[ "${{ github.event_name }}" == "schedule" ]] && gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            should_release=false
-          fi
-
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
-          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
 
   windows-installer:
     needs: validate-release
-    if: needs.validate-release.outputs.should_release == 'true'
     runs-on: windows-latest
     steps:
       - name: Check out tagged private source
@@ -146,27 +147,23 @@ jobs:
           )
           "installer=$artifactPath" >> $env:GITHUB_OUTPUT
 
-      - name: Smoke-test Windows installation
+      - name: Smoke-test installed Windows application
         shell: pwsh
         run: |
-          $installer = "${{ steps.artifact.outputs.installer }}"
-          $installProcess = Start-Process -FilePath $installer -ArgumentList "/S" -PassThru -Wait
-          if ($installProcess.ExitCode -ne 0) {
-            throw "The installer exited with code $($installProcess.ExitCode)."
+          $smokeArguments = @{
+            Installer = "${{ steps.artifact.outputs.installer }}"
+            EvidenceDirectory = "$env:RUNNER_TEMP/windows-native-qa"
           }
+          ./scripts/windows-package-smoke.ps1 @smokeArguments
 
-          $application = Get-ChildItem -Path $env:LOCALAPPDATA -Filter "worklog.exe" -File -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if (-not $application) {
-            throw "The installed Worklog executable was not found beneath LOCALAPPDATA."
-          }
-
-          $appProcess = Start-Process -FilePath $application.FullName -PassThru
-          Start-Sleep -Seconds 8
-          if ($appProcess.HasExited) {
-            throw "Worklog exited during the launch smoke test with code $($appProcess.ExitCode)."
-          }
-          Stop-Process -Id $appProcess.Id -Force
+      - name: Upload Windows native QA evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-native-qa
+          path: ${{ runner.temp }}/windows-native-qa
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload validated Windows installer
         uses: actions/upload-artifact@v7
@@ -178,7 +175,6 @@ jobs:
 
   macos-dmg:
     needs: validate-release
-    if: needs.validate-release.outputs.should_release == 'true'
     runs-on: macos-15
     steps:
       - name: Check out tagged private source
@@ -289,7 +285,6 @@ jobs:
       - validate-release
       - windows-installer
       - macos-dmg
-    if: needs.validate-release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download validated Windows installer
