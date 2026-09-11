@@ -67,7 +67,10 @@ jobs:
             echo "Source tag $release_tag was not found." >&2
             exit 1
           fi
-          git fetch origin main
+          if ! git rev-parse --verify origin/main >/dev/null 2>&1; then
+            echo "The private main branch was not fetched for release validation." >&2
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "$release_tag^{commit}" origin/main; then
             echo "Source tag $release_tag must point to a commit merged into the private main branch." >&2
             exit 1
