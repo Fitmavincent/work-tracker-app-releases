@@ -1,4 +1,7 @@
-name: Publish Worklog desktop release
+# Remote execution paused: all builds, checks and publishing run locally.
+# Remove the job guards only when remote execution is explicitly requested.
+name: Build Worklog desktop release assets
+run-name: Build Worklog ${{ inputs.release_tag }} (publish locally)
 
 on:
   workflow_dispatch:
@@ -8,13 +11,13 @@ on:
         required: true
         default: v0.3.0
       confirm_release:
-        description: Confirm this manually authorized release should be built and published
+        description: Confirm this release should be built and smoke-tested (publish locally)
         required: true
         type: boolean
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: public-desktop-release
@@ -25,6 +28,7 @@ env:
 
 jobs:
   validate-release:
+    if: ${{ false }} # Remote execution paused by maintainer request.
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
@@ -49,7 +53,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if [[ "$CONFIRM_RELEASE" != "true" ]]; then
-            echo "The confirm_release input must be selected before publishing a desktop release." >&2
+            echo "The confirm_release input must be selected before building desktop release assets." >&2
             exit 1
           fi
           if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
@@ -92,8 +96,20 @@ jobs:
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
+          jq -n --arg tag "$release_tag" --arg sha "$(git rev-parse HEAD)" \
+            --arg repository "$SOURCE_REPOSITORY" \
+            '{tag: $tag, sha: $sha, repository: $repository}' > "$RUNNER_TEMP/source.json"
+
+      - name: Upload source provenance for the local publisher
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-provenance
+          path: ${{ runner.temp }}/source.json
+          retention-days: 7
+          if-no-files-found: error
 
   windows-installer:
+    if: ${{ false }} # Remote execution paused by maintainer request.
     needs: validate-release
     runs-on: windows-latest
     steps:
@@ -177,6 +193,7 @@ jobs:
           retention-days: 7
 
   macos-dmg:
+    if: ${{ false }} # Remote execution paused by maintainer request.
     needs: validate-release
     runs-on: macos-15
     steps:
@@ -294,111 +311,3 @@ jobs:
           path: ${{ runner.temp }}/macos-dmg/*
           if-no-files-found: error
           retention-days: 7
-
-  publish-release:
-    needs:
-      - validate-release
-      - windows-installer
-      - macos-dmg
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download validated Windows installer
-        uses: actions/download-artifact@v8
-        with:
-          name: windows-installer
-          path: release-assets
-
-      - name: Download validated macOS DMG
-        uses: actions/download-artifact@v8
-        with:
-          name: macos-dmg
-          path: release-assets
-
-      - name: Create signed updater manifest
-        shell: bash
-        env:
-          APP_VERSION: ${{ needs.validate-release.outputs.version }}
-          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
-        run: |
-          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
-          jq -n \
-            --arg version "$APP_VERSION" \
-            --arg notes "Worklog ${APP_VERSION} is available with the latest fixes and improvements." \
-            --arg pub_date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            --arg windows_url "$base_url/Worklog_${APP_VERSION}_x64-setup.exe" \
-            --rawfile windows_signature "release-assets/Worklog_${APP_VERSION}_x64-setup.exe.sig" \
-            --arg macos_url "$base_url/Worklog_${APP_VERSION}_universal.app.tar.gz" \
-            --rawfile macos_signature "release-assets/Worklog_${APP_VERSION}_universal.app.tar.gz.sig" \
-            '{
-              version: $version,
-              notes: $notes,
-              pub_date: $pub_date,
-              platforms: {
-                "windows-x86_64": { signature: $windows_signature, url: $windows_url },
-                "darwin-x86_64": { signature: $macos_signature, url: $macos_url },
-                "darwin-aarch64": { signature: $macos_signature, url: $macos_url }
-              }
-            }' > release-assets/latest.json
-
-      - name: Verify complete release payload
-        shell: bash
-        env:
-          APP_VERSION: ${{ needs.validate-release.outputs.version }}
-        run: |
-          expected=(
-            "Worklog_${APP_VERSION}_x64-setup.exe"
-            "Worklog_${APP_VERSION}_x64-setup.exe.sig"
-            "Worklog_${APP_VERSION}_x64-setup.exe.sha256.txt"
-            "Worklog_${APP_VERSION}_universal.dmg"
-            "Worklog_${APP_VERSION}_universal.dmg.sha256.txt"
-            "Worklog_${APP_VERSION}_universal.app.tar.gz"
-            "Worklog_${APP_VERSION}_universal.app.tar.gz.sig"
-            "latest.json"
-          )
-          for asset in "${expected[@]}"; do
-            if [[ ! -s "release-assets/$asset" ]]; then
-              echo "Missing or empty release asset: $asset" >&2
-              exit 1
-            fi
-          done
-          if [[ "$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')" != "8" ]]; then
-            echo "The release must contain exactly eight files." >&2
-            find release-assets -maxdepth 1 -type f -print
-            exit 1
-          fi
-
-          cd release-assets
-          sha256sum --check "Worklog_${APP_VERSION}_x64-setup.exe.sha256.txt"
-          sha256sum --check "Worklog_${APP_VERSION}_universal.dmg.sha256.txt"
-          jq -e \
-            --arg version "$APP_VERSION" \
-            --rawfile windows_signature "Worklog_${APP_VERSION}_x64-setup.exe.sig" \
-            --rawfile macos_signature "Worklog_${APP_VERSION}_universal.app.tar.gz.sig" '
-            .version == $version and
-            .platforms["windows-x86_64"].signature == $windows_signature and
-            .platforms["darwin-x86_64"].signature == $macos_signature and
-            .platforms["darwin-aarch64"].signature == $macos_signature and
-            (.platforms["windows-x86_64"].url | endswith("Worklog_" + $version + "_x64-setup.exe")) and
-            (.platforms["darwin-x86_64"].url | endswith("Worklog_" + $version + "_universal.app.tar.gz")) and
-            (.platforms["darwin-aarch64"] == .platforms["darwin-x86_64"])
-          ' latest.json >/dev/null
-
-      - name: Publish complete public release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
-        run: |
-          notes='Download the Windows setup executable or universal macOS DMG for Worklog. This release also publishes cryptographically signed updater packages and a latest.json feed so updater-enabled installations can update from Settings. Verify the matching SHA-256 checksum if required. These preview packages are not yet publicly trusted: Windows may show SmartScreen and macOS may require approval in Privacy & Security.'
-          assets=(release-assets/*)
-
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "Worklog $RELEASE_TAG" --notes "$notes"
-          else
-            gh release create "$RELEASE_TAG" "${assets[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target main \
-              --title "Worklog $RELEASE_TAG" \
-              --notes "$notes"
-          fi

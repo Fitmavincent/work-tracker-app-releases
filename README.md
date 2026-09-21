@@ -1,5 +1,10 @@
 # Worklog desktop downloads
 
+> Remote execution is paused as of 2026-09-21. Every retained workflow job
+> has an unconditional false guard. Build, validation, release publication,
+> mirroring and landing-page deployment run locally. Descriptions of optional
+> Actions builders below are retained for a future explicitly authorised reactivation.
+
 This public repository contains the official Windows and macOS preview installers for Worklog, a private local-first desktop work tracker. The application source remains in a separate private repository.
 
 ## Download
@@ -46,6 +51,8 @@ shasum -a 256 -c Worklog_<version>_universal.dmg.sha256.txt
 
 ## Release process
 
-GitHub Actions checks out tagged source through a read-only deploy key, validates matching npm, Cargo, and Tauri versions, builds Windows and macOS packages, signs their updater artifacts with protected repository secrets, installs or mounts and launches each package in a smoke test, verifies both checksums, creates `latest.json`, and publishes the complete eight-file asset set only after both platform jobs pass. The workflow runs hourly for new source tags and can also be dispatched manually.
+The manual **Build Worklog desktop release assets** workflow checks out tagged source through a read-only deploy key, validates matching versions and merged-main ancestry, builds and signs Windows/macOS packages, smoke-tests both platforms, and uploads the seven native files plus source provenance. It does not publish or run on a schedule.
+
+An authenticated maintainer uses the private source repository's `npm run release` commands to prepare `latest.json`, validate the exact eight-file payload, upload and byte-verify a draft, publish the public release, verify the stable updater feed, and publish the byte-identical private mirror. Native builds can also run locally. See `docs/local-pipelines.md` in the source repository for the maintained runbook.
 
 Worklog stores records on the local device. Export JSON backups regularly because application-local data is not a backup.
